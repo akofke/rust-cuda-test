@@ -1,1 +1,9 @@
 ptx-linker must be patched to use 0.2.0 rustc-llvm-linker and then installed
+
+Requires CARGO_BUILD_PIPELINING=false to avoid "crate foo required to be available in rlib format...",
+but only when device code is a separate crate?
+
+Device code should be separate crate to avoid problems with no-std dependencies. When host and device code are used
+in the same crate with conditional compilation and both transitively depend on the same crate (e.g. num-traits for
+num-complex), but one of them does not disable "std" feature, cargo tries to build the device dependency *with* std,
+even though ptx-builder is using a different target.

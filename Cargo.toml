@@ -8,6 +8,10 @@ edition = "2018"
 
 [target.'cfg(not(target_os = "cuda"))'.dependencies]
 rustacuda = "*"
+num-complex = {version = "0.2.4", default-features = false }
+palette = "0.5.0"
+image = "0.23.0-preview.0"
+anyhow = "1.0"
 
 [target.'cfg(target_os = "cuda")'.dependencies]
 ptx-support = {git = "https://github.com/denzp/rust-ptx-support", default-features = true}
