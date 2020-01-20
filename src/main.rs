@@ -6,10 +6,12 @@ use std::ffi::CString;
 use rustacuda::prelude::*;
 use rustacuda::launch;
 use rustacuda::memory::{DeviceBox, DeviceSlice, DevicePointer};
-use palette::{Srgb, Mix, Pixel};
+use palette::{Srgb, Mix, Pixel, LinSrgb};
 use anyhow::{Context as AnyhowContext};
 use minifb::{Window, WindowOptions, Scale, MouseMode, MouseButton};
 use std::time::Duration;
+use palette::rgb::Rgb;
+use palette::encoding::Linear;
 
 fn pack_color(c: [u8; 3]) -> u32 {
     let [r, g, b] = c;
@@ -36,7 +38,7 @@ pub fn main() -> anyhow::Result<()> {
 
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
-    let function = module.get_function(&CString::new("mandelbrot_kernel")?)?;
+    let function = module.get_function(&CString::new("mandelbrot_kernel_colors")?)?;
 
 
     const WIDTH: usize = 512;
@@ -67,9 +69,12 @@ pub fn main() -> anyhow::Result<()> {
     let mut max_re = 0.7;
     let mut min_im = -1.2;
     let mut max_im = min_im + (max_re - min_re) * (HEIGHT as f64 / WIDTH as f64);
-    let max_iter = 255u32;
+    let max_iter = 1024;
 
     let color = pack_color([0, 127, 255]);
+
+    let colors = make_colors(max_iter);
+    let mut device_colors = DeviceBuffer::from_slice(&colors)?;
 
     window.update_with_buffer(&kernel.host_buffer, WIDTH, HEIGHT)?;
     while window.is_open() {
@@ -90,19 +95,15 @@ pub fn main() -> anyhow::Result<()> {
             max_re -= (1.0 - scale_fac) * (max_re - point_re);
             min_im += (1.0 - scale_fac) * (point_im - min_im);
             max_im -= (1.0 - scale_fac) * (max_im - point_im);
-            dbg!(((min_re, min_im), (max_re, max_im)));
         }
 
 
         kernel.compute_image(
             (w as u32, h as u32),
             (Complex64::new(min_re, min_im), Complex64::new(max_re, max_im)),
+            &mut device_colors,
             max_iter,
         )?;
-
-        let start = std::time::Instant::now();
-        map_colors(&mut kernel.host_buffer, max_iter);
-        println!("Computed colors in {} ms", start.elapsed().as_millis());
 
         window.update_with_buffer(&kernel.host_buffer, w, h)?;
     }
@@ -193,6 +194,19 @@ pub fn map_colors(buf: &mut [u32], max_iter: u32) {
     }
 }
 
+fn make_colors(max_iter: u32) -> Vec<u32> {
+    let orangeish = Srgb::new(1.0, 0.6, 0.0).into_linear();
+    let blueish = Srgb::new(0.0, 0.2, 1.0).into_linear();
+    (0..max_iter)
+        .map(|n| {
+            let fac = n as f64 / max_iter as f64;
+            let mixed = blueish.mix(&orangeish, fac);
+            let color: [u8; 3] = Srgb::from_linear(mixed).into_format().into_raw();
+            pack_color(color)
+        })
+        .collect()
+}
+
 struct MandelbrotKernel<'a> {
     stream: &'a Stream,
     function: &'a Function<'a>,
@@ -210,7 +224,12 @@ impl<'a> MandelbrotKernel<'a> {
         Ok(())
     }
 
-    fn compute_image(&mut self, image_dims: (u32, u32), bounds: (Complex64, Complex64), max_iter: u32) -> anyhow::Result<()> {
+    fn compute_image(&mut self,
+                     image_dims: (u32, u32),
+                     bounds: (Complex64, Complex64),
+                     colors: &mut DeviceBuffer<u32>,
+                     max_iter: u32
+    ) -> anyhow::Result<()> {
         self.resize(image_dims)?;
         let (w, h) = image_dims;
         let (min, max) = bounds;
@@ -241,6 +260,7 @@ impl<'a> MandelbrotKernel<'a> {
                 re_step,
                 im_step,
                 max_iter,
+                colors.as_device_ptr(),
                 self.device_buffer.as_device_ptr()
             )).context("failed to launch kernel")?
         }
