@@ -40,21 +40,32 @@ pub fn mandelbrot_value_fast(cr: f64, ci: f64, max_iter: u32) -> u32 {
             i = unchecked_add(i, 1);
         }
     }
-//    (0..max_iter)
-//        .fold((0.0, 0.0, 0.0, 0.0), |(zr, zi, zrsqr, zisqr), _i| {
-//            unsafe {
-////            zi = 2.0 * zr * zi + ci;
-//                let zi = fadd_fast(fmul_fast(fmul_fast(2.0, zr), zi), ci);
-////            zr = zrsqr - zisqr + cr;
-//                let zr = fadd_fast(fsub_fast(zrsqr, zisqr), cr);
-////            zrsqr = zr * zr;
-//                let zrsqr = fmul_fast(zr, zr);
-////            zisqr = zi * zi;
-//                let zisqr = fmul_fast(zi, zi);
-//                (zr, zi, zrsqr, zisqr)
-//            }
-//        })
-//        .take_while()
-
     i as u32
+}
+
+pub fn julia_value(cr: f64, ci: f64, kr: f64, ki: f64, max_iter: u32) -> u32 {
+    use core::intrinsics::*;
+    let mut zr = cr;
+    let mut zi = ci;
+    let mut zrsqr = zr * zr;
+    let mut zisqr = zi * zi;
+    let mut i = 0i32;
+    unsafe {
+        while i < (max_iter as i32) {
+//            zi = 2.0 * zr * zi + ci;
+            zi = fadd_fast(fmul_fast(fmul_fast(2.0, zr), zi), ki);
+//            zr = zrsqr - zisqr + cr;
+            zr = fadd_fast(fsub_fast(zrsqr, zisqr), kr);
+//            zrsqr = zr * zr;
+            zrsqr = fmul_fast(zr, zr);
+//            zisqr = zi * zi;
+            zisqr = fmul_fast(zi, zi);
+            if fadd_fast(zrsqr, zisqr) > 4.0 {
+                break;
+            }
+            i = unchecked_add(i, 1);
+        }
+    }
+    i as u32
+
 }

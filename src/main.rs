@@ -22,6 +22,14 @@ fn unpack_color(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
+const WIDTH: usize = 512;
+const HEIGHT: usize = 512;
+
+const MIN_RE: f64 = -2.0;
+const MAX_RE: f64 = 0.7;
+const MIN_IM: f64 = -1.2;
+const MAX_IM: f64 = MIN_IM + (MAX_RE - MIN_RE) * (HEIGHT as f64 / WIDTH as f64);
+
 pub fn main() -> anyhow::Result<()> {
     println!(env!("KERNEL_PTX_PATH"));
     let ptx_file = CString::new(include_str!(env!("KERNEL_PTX_PATH")))?;
@@ -39,44 +47,60 @@ pub fn main() -> anyhow::Result<()> {
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
     let function = module.get_function(&CString::new("mandelbrot_kernel_colors")?)?;
+    let julia_function = module.get_function(&CString::new("julia_set")?)?;
 
 
-    const WIDTH: usize = 512;
-    const HEIGHT: usize = 512;
 
     let mut window = Window::new(
         "Mandelbrot",
         WIDTH,
         HEIGHT,
         WindowOptions {
-            resize: true,
+            resize: false,
+            scale: Scale::X2,
+            ..Default::default()
+        }
+    )?;
+
+    let mut julia_window = Window::new(
+        "Julia Set",
+        WIDTH,
+        HEIGHT,
+        WindowOptions {
+            resize: false,
             scale: Scale::X2,
             ..Default::default()
         }
     )?;
 
     window.limit_update_rate(Some(Duration::from_millis(32)));
+    julia_window.limit_update_rate(Some(Duration::from_millis(32)));
+
 
     let device_buffer = unsafe { DeviceBuffer::zeroed(WIDTH * HEIGHT) }?;
+    let device_buffer_julia = unsafe { DeviceBuffer::zeroed(WIDTH * HEIGHT) }?;
     let mut kernel = MandelbrotKernel {
         stream: &stream,
         function: &function,
+        julia_function: &julia_function,
         device_buffer,
+        device_buffer_julia,
         host_buffer: vec![0; WIDTH * HEIGHT],
+        host_buffer_julia: vec![0; WIDTH * HEIGHT],
     };
 
-    let mut min_re = -2.0;
-    let mut max_re = 0.7;
-    let mut min_im = -1.2;
-    let mut max_im = min_im + (max_re - min_re) * (HEIGHT as f64 / WIDTH as f64);
+    let mut min_re = MIN_RE;
+    let mut max_re = MAX_RE;
+    let mut min_im = MIN_IM;
+    let mut max_im = MAX_IM;
     let max_iter = 1024;
-
-    let color = pack_color([0, 127, 255]);
 
     let colors = make_colors(max_iter);
     let mut device_colors = DeviceBuffer::from_slice(&colors)?;
 
     window.update_with_buffer(&kernel.host_buffer, WIDTH, HEIGHT)?;
+    let mut mouse_coords = (0.0, 0.0);
+    let mut need_update = true;
     while window.is_open() {
         let mouse_pos = window.get_mouse_pos(MouseMode::Discard);
         let unscaled_mouse_pos = window.get_unscaled_mouse_pos(MouseMode::Discard);
@@ -85,27 +109,38 @@ pub fn main() -> anyhow::Result<()> {
         let (w, h) = window.get_size();
         let scale_fac = 0.9;
 
-        if let (Some((x, y)), true) = (unscaled_mouse_pos, mouse_down) {
+        if let Some((x, y)) = unscaled_mouse_pos {
             let frac_x = x as f64 / w as f64;
             let frac_y = 1.0 - (y as f64 / h as f64);
             let point_re = min_re + (max_re - min_re) * frac_x;
             let point_im = min_im + (max_im - min_im) * frac_y;
+            mouse_coords = (point_re, point_im);
 
-            min_re += (1.0 - scale_fac) * (point_re - min_re);
-            max_re -= (1.0 - scale_fac) * (max_re - point_re);
-            min_im += (1.0 - scale_fac) * (point_im - min_im);
-            max_im -= (1.0 - scale_fac) * (max_im - point_im);
+            if mouse_down {
+                min_re += (1.0 - scale_fac) * (point_re - min_re);
+                max_re -= (1.0 - scale_fac) * (max_re - point_re);
+                min_im += (1.0 - scale_fac) * (point_im - min_im);
+                max_im -= (1.0 - scale_fac) * (max_im - point_im);
+            }
+            need_update = true;
         }
 
 
-        kernel.compute_image(
-            (w as u32, h as u32),
-            (Complex64::new(min_re, min_im), Complex64::new(max_re, max_im)),
-            &mut device_colors,
-            max_iter,
-        )?;
+        if need_update {
+            kernel.compute_image(
+                (w as u32, h as u32),
+                (Complex64::new(min_re, min_im), Complex64::new(max_re, max_im)),
+                mouse_coords,
+                &mut device_colors,
+                max_iter,
+            )?;
 
-        window.update_with_buffer(&kernel.host_buffer, w, h)?;
+            window.update_with_buffer(&kernel.host_buffer, w, h)?;
+            julia_window.update_with_buffer(&kernel.host_buffer_julia, w, h)?;
+            need_update = false;
+        } else {
+            window.update();
+        }
     }
 
     Ok(())
@@ -210,8 +245,11 @@ fn make_colors(max_iter: u32) -> Vec<u32> {
 struct MandelbrotKernel<'a> {
     stream: &'a Stream,
     function: &'a Function<'a>,
+    julia_function: &'a Function<'a>,
     device_buffer: DeviceBuffer<u32>,
+    device_buffer_julia: DeviceBuffer<u32>,
     host_buffer: Vec<u32>,
+    host_buffer_julia: Vec<u32>,
 }
 
 impl<'a> MandelbrotKernel<'a> {
@@ -219,7 +257,9 @@ impl<'a> MandelbrotKernel<'a> {
         if image_dims.0 as usize * image_dims.1 as usize != self.device_buffer.len() {
             let new_buf = unsafe { DeviceBuffer::zeroed(image_dims.0 as usize * image_dims.1 as usize) }?;
             self.device_buffer = new_buf;
+            self.device_buffer_julia = unsafe { DeviceBuffer::zeroed(image_dims.0 as usize * image_dims.1 as usize) }?;
             self.host_buffer = vec![0; image_dims.0 as usize * image_dims.1 as usize];
+            self.host_buffer_julia = vec![0; image_dims.0 as usize * image_dims.1 as usize];
         }
         Ok(())
     }
@@ -227,6 +267,7 @@ impl<'a> MandelbrotKernel<'a> {
     fn compute_image(&mut self,
                      image_dims: (u32, u32),
                      bounds: (Complex64, Complex64),
+                     julia_coords: (f64, f64),
                      colors: &mut DeviceBuffer<u32>,
                      max_iter: u32
     ) -> anyhow::Result<()> {
@@ -242,6 +283,11 @@ impl<'a> MandelbrotKernel<'a> {
         let re_step = (max_re - min_re) / (w as f64 - 1.0);
         let im_step = (max_im - min_im) / (h as f64 - 1.0);
 
+        let min_re_julia = MIN_RE;
+        let max_im_julia = MAX_IM;
+        let re_step_julia = (MAX_RE - MIN_RE) / (WIDTH as f64 - 1.0);
+        let im_step_julia = (MAX_IM - MIN_IM) / (HEIGHT as f64 - 1.0);
+
         let block_size = (32, 32);
         let grid_w = (w - 1) / block_size.0 + 1;
         let grid_h = (h - 1) / block_size.1 + 1;
@@ -250,6 +296,7 @@ impl<'a> MandelbrotKernel<'a> {
 
         let stream = self.stream;
         let function = self.function;
+        let julia_function = self.julia_function;
 
         unsafe {
             launch!(function<<<(grid_w, grid_h), block_size, 0, stream>>>(
@@ -265,11 +312,28 @@ impl<'a> MandelbrotKernel<'a> {
             )).context("failed to launch kernel")?
         }
 
+        unsafe {
+            launch!(julia_function<<<(grid_w, grid_h), block_size, 0, stream>>>(
+                w,
+                h,
+                min_re_julia,
+                max_im_julia,
+                re_step_julia,
+                im_step_julia,
+                julia_coords.0,
+                julia_coords.1,
+                max_iter,
+                colors.as_device_ptr(),
+                self.device_buffer_julia.as_device_ptr()
+            )).context("failed to launch kernel")?
+        }
+
         stream.synchronize()?;
         let end = start.elapsed();
         println!("Kernel completed in {} ms", end.as_millis());
-        let start = std::time::Instant::now();
+//        let start = std::time::Instant::now();
         self.device_buffer.copy_to(&mut self.host_buffer)?;
+        self.device_buffer_julia.copy_to(&mut self.host_buffer_julia)?;
 //        println!("Got array back to host, len {} in {} ms", self.host_buffer.len(), start.elapsed().as_millis());
 
         Ok(())
